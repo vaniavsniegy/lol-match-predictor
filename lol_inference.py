@@ -50,8 +50,8 @@ def load_models():
 # ---------------------------------------------------------------------------
 
 CHAMP_COLS = [
-    'blue_pick1', 'blue_pick2', 'blue_pick3', 'blue_pick4', 'blue_pick5',
-    'red_pick1',  'red_pick2',  'red_pick3',  'red_pick4',  'red_pick5',
+    'blue_top_champ', 'blue_jng_champ', 'blue_mid_champ', 'blue_bot_champ', 'blue_sup_champ',
+    'red_top_champ',  'red_jng_champ',  'red_mid_champ',  'red_bot_champ',  'red_sup_champ',
     'blue_ban1',  'blue_ban2',  'blue_ban3',  'blue_ban4',  'blue_ban5',
     'red_ban1',   'red_ban2',   'red_ban3',   'red_ban4',   'red_ban5',
 ]
@@ -61,24 +61,18 @@ PLAYER_COLS = [
 ]
 
 
-def _enc(col, value, encoders):
-    """Encode a single value using the shared encoder dict."""
-    value = str(value)
+def _get_cats(col, encoders):
+    """Return (categories_list, rare_set) for a categorical column, or (None, None) for numeric."""
     if col in CHAMP_COLS or col == 'champion':
-        le, rare = encoders['__champion__'], encoders['_rare_champs']
-    elif col in PLAYER_COLS or col == 'playername':
-        le, rare = encoders['__player__'], encoders['_rare_players']
-    elif col == 'position':
-        le, rare = encoders['position'], set()
-    elif col in encoders:
-        le, rare = encoders[col], set()
-    else:
-        return value  # numeric — pass through
-    if (value in rare or value not in le.classes_) and '__rare__' in le.classes_:
-        value = '__rare__'
-    elif value not in le.classes_:
-        return 0  # position encoder: unknown value, fallback to 0
-    return int(le.transform([value])[0])
+        return encoders['__champion_cats__'], encoders['_rare_champs']
+    if col in PLAYER_COLS or col == 'playername':
+        return encoders['__player_cats__'], encoders['_rare_players']
+    if col == 'position':
+        return encoders['position_cats'], set()
+    cats_key = f'{col}_cats'
+    if cats_key in encoders:
+        return encoders[cats_key], set()
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -96,26 +90,31 @@ def _flatten(match_info):
         'split':    match_info.get('split',  'unknown'),
         'playoffs': int(match_info.get('playoffs', 0)),
     }
-    for i, champ in enumerate(blue.get('picks', []), 1):
-        flat[f'blue_pick{i}'] = champ
-    for i, champ in enumerate(red.get('picks', []), 1):
-        flat[f'red_pick{i}'] = champ
     for i, champ in enumerate(blue.get('bans', []), 1):
         flat[f'blue_ban{i}'] = champ
     for i, champ in enumerate(red.get('bans', []), 1):
         flat[f'red_ban{i}'] = champ
     for pos in POSITIONS:
-        flat[f'blue_{pos}'] = blue['players'][pos]['name']
-        flat[f'red_{pos}']  = red['players'][pos]['name']
+        flat[f'blue_{pos}']       = blue['players'][pos]['name']
+        flat[f'blue_{pos}_champ'] = blue['players'][pos]['champion']
+        flat[f'red_{pos}']        = red['players'][pos]['name']
+        flat[f'red_{pos}_champ']  = red['players'][pos]['champion']
     return flat
 
 
 def _build_row(feature_cols, flat, encoders):
-    """Build an encoded single-row DataFrame for model prediction."""
-    row = {}
+    """Build a single-row DataFrame with categorical dtypes for model prediction."""
+    df = pd.DataFrame([{col: flat.get(col, 0) for col in feature_cols}])
     for col in feature_cols:
-        row[col] = _enc(col, flat.get(col, 0), encoders)
-    return pd.DataFrame([row]).apply(pd.to_numeric, errors='coerce').fillna(0)
+        cats, rare = _get_cats(col, encoders)
+        if cats is None:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        else:
+            val = str(df[col].iloc[0])
+            if val in rare or val not in set(cats):
+                val = '__rare__'
+            df[col] = pd.Categorical([val], categories=cats)
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +178,6 @@ def predict_match(loaded_models, match_info, mode='prematch'):
         },
         'blue': {
             'team': 'T1',
-            'picks': ['Gnar', 'Vi', 'Azir', 'Jinx', 'Thresh'],   # draft order
             'bans':  ['Zed', 'Yasuo', 'Katarina', 'LeBlanc', 'Syndra'],
             'players': {
                 'top': {'name': 'Zeus',     'champion': 'Gnar',
@@ -193,7 +191,6 @@ def predict_match(loaded_models, match_info, mode='prematch'):
         },
         'red': {
             'team': 'Gen.G',
-            'picks': ['Jayce', 'Graves', 'Orianna', 'Aphelios', 'Lulu'],
             'bans':  ['Caitlyn', 'Lux', 'Ahri', 'Karma', 'Xayah'],
             'players': {
                 'top': {'name': 'Doran',   'champion': 'Jayce', ...},
@@ -281,7 +278,6 @@ if __name__ == "__main__":
         },
         'blue': {
             'team': 'T1',
-            'picks': ['Gnar', 'Vi', 'Azir', 'Jinx', 'Thresh'],
             'bans':  ['Zed', 'Yasuo', 'Katarina', 'LeBlanc', 'Syndra'],
             'players': {
                 'top': {'name': 'Zeus',     'champion': 'Gnar',
@@ -303,7 +299,6 @@ if __name__ == "__main__":
         },
         'red': {
             'team': 'Gen.G',
-            'picks': ['Jayce', 'Graves', 'Orianna', 'Aphelios', 'Lulu'],
             'bans':  ['Caitlyn', 'Lux', 'Ahri', 'Karma', 'Xayah'],
             'players': {
                 'top': {'name': 'Doran',   'champion': 'Jayce',
