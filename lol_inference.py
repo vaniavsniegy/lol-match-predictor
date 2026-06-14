@@ -215,7 +215,7 @@ def predict_match(loaded_models, match_info, mode='prematch'):
     """
     encoders = loaded_models['encoders']
     flat     = _flatten(match_info)
-
+    print(flat)
     # Add team-level 15-min stats to flat dict if provided
     for stat, val in match_info.get('stats', {}).items():
         flat[stat] = val

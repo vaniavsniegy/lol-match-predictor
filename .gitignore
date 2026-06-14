@@ -1,0 +1,8 @@
+# Local data and generated outputs
+data/
+models/
+results/
+
+# macOS
+.DS_Store
+**/.DS_Store
