@@ -1,11 +1,10 @@
-
 import pandas as pd
 import numpy as np
 import xgboost as xgb
 from xgboost.callback import TrainingCallback
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, mean_squared_error
-from sklearn.preprocessing import LabelEncoder
+
 import joblib
 import glob
 import os
@@ -36,8 +35,8 @@ os.makedirs(ROOT, exist_ok=True)
 POSITIONS  = ['top', 'jng', 'mid', 'bot', 'sup']
 
 CHAMP_COLS = [
-    'blue_pick1', 'blue_pick2', 'blue_pick3', 'blue_pick4', 'blue_pick5',
-    'red_pick1',  'red_pick2',  'red_pick3',  'red_pick4',  'red_pick5',
+    'blue_top_champ', 'blue_jng_champ', 'blue_mid_champ', 'blue_bot_champ', 'blue_sup_champ',
+    'red_top_champ',  'red_jng_champ',  'red_mid_champ',  'red_bot_champ',  'red_sup_champ',
     'blue_ban1',  'blue_ban2',  'blue_ban3',  'blue_ban4',  'blue_ban5',
     'red_ban1',   'red_ban2',   'red_ban3',   'red_ban4',   'red_ban5',
 ]
@@ -89,22 +88,30 @@ def build_match_df(df):
         wide.columns = [f'{side.lower()}_{c}' for c in wide.columns]
         return wide.reset_index()
 
+    def pivot_champions(side):
+        p = df[(df['position'].isin(POSITIONS)) & (df['side'] == side)][
+            ['gameid', 'position', 'champion']
+        ]
+        wide = p.pivot_table(index='gameid', columns='position',
+                             values='champion', aggfunc='first')
+        wide.columns.name = None
+        wide.columns = [f'{side.lower()}_{c}_champ' for c in wide.columns]
+        return wide.reset_index()
+
     blue_roster = pivot_roster('Blue')
     red_roster  = pivot_roster('Red')
+    blue_champs = pivot_champions('Blue')
+    red_champs  = pivot_champions('Red')
 
     blue = df[(df['position'] == 'team') & (df['side'] == 'Blue')].copy()
     blue = blue.rename(columns={
         'teamname': 'blue_teamname',
-        'pick1': 'blue_pick1', 'pick2': 'blue_pick2', 'pick3': 'blue_pick3',
-        'pick4': 'blue_pick4', 'pick5': 'blue_pick5',
         'ban1':  'blue_ban1',  'ban2':  'blue_ban2',  'ban3':  'blue_ban3',
         'ban4':  'blue_ban4',  'ban5':  'blue_ban5',
     })
 
     red_keep = {
         'gameid': 'gameid', 'teamname': 'red_teamname',
-        'pick1': 'red_pick1', 'pick2': 'red_pick2', 'pick3': 'red_pick3',
-        'pick4': 'red_pick4', 'pick5': 'red_pick5',
         'ban1':  'red_ban1',  'ban2':  'red_ban2',  'ban3':  'red_ban3',
         'ban4':  'red_ban4',  'ban5':  'red_ban5',
     }
@@ -114,7 +121,9 @@ def build_match_df(df):
     match_df = (blue
                 .merge(red,         on='gameid', how='inner')
                 .merge(blue_roster, on='gameid', how='left')
-                .merge(red_roster,  on='gameid', how='left'))
+                .merge(red_roster,  on='gameid', how='left')
+                .merge(blue_champs, on='gameid', how='left')
+                .merge(red_champs,  on='gameid', how='left'))
 
     match_df = _add_temporal_weights(match_df)
     print(f"Match dataset: {len(match_df):,} matches")
@@ -147,26 +156,23 @@ def _add_temporal_weights(df, half_life_days=90):
 
 
 def build_encoders(match_df, player_df=None):
-    """Fit shared encoders for all categorical columns across all models.
+    """Build category lists for all categorical columns across all models.
 
     Returns a dict with:
-      '__champion__' : LabelEncoder for all champion names (picks, bans, individual champion)
-      '__player__'   : LabelEncoder for all player names (roster cols + individual playername)
-      'position'     : LabelEncoder for position strings
-      col            : LabelEncoder for each context/teamname/league/split column
-      '_rare_champs' : set of rare champion names (< 50 appearances)
-      '_rare_players': set of rare player names  (< 50 appearances)
+      '__champion_cats__' : sorted list of known champion names + '__rare__'
+      '__player_cats__'   : sorted list of known player names  + '__rare__'
+      'position_cats'     : list of valid position strings
+      '{col}_cats'        : category list for each context column
+      '_rare_champs'      : set of rare champion names (< 50 appearances)
+      '_rare_players'     : set of rare player names  (< 50 appearances)
     """
     encoders = {}
 
     # Champions — global rarity across all pick + ban slots
     all_champs = pd.concat([match_df[c].dropna() for c in CHAMP_COLS]).astype(str)
     rare_champs = set(all_champs.value_counts().pipe(lambda s: s[s < 50]).index)
-    bucketed_champs = all_champs.apply(lambda v: '__rare__' if v in rare_champs else v)
-    le_champ = LabelEncoder()
-    le_champ.fit(pd.concat([bucketed_champs, pd.Series(['__rare__'])]).unique())
-    encoders['__champion__'] = le_champ
-    encoders['_rare_champs'] = rare_champs
+    encoders['_rare_champs']      = rare_champs
+    encoders['__champion_cats__'] = sorted(set(all_champs) - rare_champs) + ['__rare__']
 
     # Players — global rarity across all roster slots + individual playername
     player_sources = [match_df[c].dropna() for c in PLAYER_COLS]
@@ -174,25 +180,16 @@ def build_encoders(match_df, player_df=None):
         player_sources.append(player_df['playername'].dropna())
     all_players = pd.concat(player_sources).astype(str)
     rare_players = set(all_players.value_counts().pipe(lambda s: s[s < 50]).index)
-    bucketed_players = all_players.apply(lambda v: '__rare__' if v in rare_players else v)
-    le_player = LabelEncoder()
-    le_player.fit(pd.concat([bucketed_players, pd.Series(['__rare__'])]).unique())
-    encoders['__player__'] = le_player
-    encoders['_rare_players'] = rare_players
+    encoders['_rare_players']    = rare_players
+    encoders['__player_cats__']  = sorted(set(all_players) - rare_players) + ['__rare__']
 
     # Position
-    le_pos = LabelEncoder()
-    le_pos.fit(POSITIONS)
-    encoders['position'] = le_pos
+    encoders['position_cats'] = POSITIONS[:]
 
-    # Context columns — individual encoders; include __rare__ so unknown values at inference
-    # fall back safely instead of crashing with a ValueError
+    # Context columns — include __rare__ so unknown values at inference fall back safely
     for col in ['blue_teamname', 'red_teamname', 'league', 'split']:
         if col in match_df.columns:
-            le = LabelEncoder()
-            vals = list(match_df[col].dropna().astype(str).unique()) + ['__rare__']
-            le.fit(vals)
-            encoders[col] = le
+            encoders[f'{col}_cats'] = sorted(match_df[col].dropna().astype(str).unique().tolist()) + ['__rare__']
 
     # Frequency tables (for use at inference when freq is unknown)
     if player_df is not None:
@@ -205,45 +202,33 @@ def build_encoders(match_df, player_df=None):
     return encoders
 
 
+def _get_cats(col, encoders):
+    """Return (categories_list, rare_set) for a categorical column, or (None, None) for numeric."""
+    if col in CHAMP_COLS or col == 'champion':
+        return encoders['__champion_cats__'], encoders['_rare_champs']
+    if col in PLAYER_COLS or col == 'playername':
+        return encoders['__player_cats__'], encoders['_rare_players']
+    if col == 'position':
+        return encoders['position_cats'], set()
+    cats_key = f'{col}_cats'
+    if cats_key in encoders:
+        return encoders[cats_key], set()
+    return None, None
+
+
 def _apply_encoders(df, cols, encoders):
-    """Encode a list of columns in df using the shared encoder dict. Returns df copy."""
+    """Set categorical columns to pd.Categorical dtype with rare-value bucketing."""
     df = df.copy()
     for col in cols:
-        le, rare = _resolve_encoder(col, encoders)
-        if le is None:
+        cats, rare = _get_cats(col, encoders)
+        if cats is None:
             continue
-        has_rare = '__rare__' in le.classes_
-        rare_code = int(le.transform(['__rare__'])[0]) if has_rare else 0
-        # Vectorized lookup: pre-build {value: code} excluding rare-bucketed values so
-        # they fall through to fillna(rare_code) — avoids per-row Python calls
-        lookup = {cls: int(code) for cls, code in zip(le.classes_, le.transform(le.classes_))
-                  if cls not in rare}
-        df[col] = df[col].astype(str).map(lookup).fillna(rare_code).astype(int)
+        cats_set = set(cats)
+        df[col] = pd.Categorical(
+            df[col].astype(str).apply(lambda v: '__rare__' if v in rare or v not in cats_set else v),
+            categories=cats
+        )
     return df
-
-
-def _resolve_encoder(col, encoders):
-    """Return (LabelEncoder, rare_set) for a given column name."""
-    if col in CHAMP_COLS or col == 'champion':
-        return encoders['__champion__'], encoders['_rare_champs']
-    if col in PLAYER_COLS or col == 'playername':
-        return encoders['__player__'], encoders['_rare_players']
-    if col == 'position':
-        return encoders['position'], set()
-    if col in encoders:
-        return encoders[col], set()
-    return None, set()
-
-
-def encode_value(col, value, encoders):
-    """Encode a single raw value for inference."""
-    le, rare = _resolve_encoder(col, encoders)
-    if le is None:
-        return value
-    value = str(value)
-    if value in rare or value not in le.classes_:
-        value = '__rare__'
-    return int(le.transform([value])[0])
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +244,7 @@ def _class_scale_weight(y):
 def _fit_classifier(X_train, y_train, w_train, scale_weight, label='', n_estimators=200, lr=0.05):
     m = xgb.XGBClassifier(n_estimators=n_estimators, max_depth=4, learning_rate=lr,
                            scale_pos_weight=scale_weight, random_state=42,
-                           tree_method='hist', n_jobs=-1,
+                           tree_method='hist', enable_categorical=True, n_jobs=-1,
                            callbacks=[_ProgressBar(n_estimators, label)])
     m.fit(X_train, y_train, sample_weight=w_train)
     return m
@@ -268,7 +253,7 @@ def _fit_classifier(X_train, y_train, w_train, scale_weight, label='', n_estimat
 def _fit_regressor(X_train, y_train, w_train, label=''):
     n = 150
     m = xgb.XGBRegressor(n_estimators=n, max_depth=4, learning_rate=0.05, random_state=42,
-                          tree_method='hist', n_jobs=-1,
+                          tree_method='hist', enable_categorical=True, n_jobs=-1,
                           callbacks=[_ProgressBar(n, label)])
     m.fit(X_train, y_train, sample_weight=w_train)
     return m
